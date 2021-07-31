@@ -3,7 +3,7 @@ mod helpers;
 
 use helpers::*;
 
-use crate::db::DBGame;
+use crate::db::*;
 use anyhow::Context as AnyHowContext;
 use image::png::PngEncoder;
 use image::{ColorType, RgbImage};
@@ -19,8 +19,7 @@ use serenity::framework::StandardFramework;
 use serenity::http::{AttachmentType, Http};
 use serenity::model::prelude::*;
 use serenity::prelude::*;
-use sqlx::pool::PoolConnection;
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::SqlitePool;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -190,30 +189,6 @@ async fn dispatch_error(ctx: &Context, msg: &Message, error: DispatchError) {
 	}
 }
 
-struct DB(SqlitePool);
-impl TypeMapKey for DB {
-	type Value = SqlitePool;
-}
-impl DB {
-	async fn pool(ctx: &Context) -> anyhow::Result<SqlitePool> {
-		let datas = ctx.data.read().await;
-		Ok(datas
-			.get::<DB>()
-			.context("db missing from TypeMap")?
-			.clone())
-	}
-
-	async fn acquire(ctx: &Context) -> anyhow::Result<PoolConnection<Sqlite>> {
-		let db = Self::pool(ctx).await?;
-		Ok(db.acquire().await?)
-	}
-
-	async fn begin(ctx: &Context) -> anyhow::Result<Transaction<'_, Sqlite>> {
-		let db = Self::pool(ctx).await?;
-		Ok(db.begin().await?)
-	}
-}
-
 struct Handler;
 
 #[serenity::async_trait]
@@ -223,7 +198,7 @@ impl EventHandler for Handler {}
 #[prefixes("tank", "t")]
 #[summary = "Tank Game"]
 #[description = "Tank Game"]
-#[commands(ping, init, destroy, join, board, supply)]
+#[commands(ping, init, destroy, join, board, supply, move_)] // attack, give, vote
 struct TankGame;
 
 #[help]
@@ -747,5 +722,64 @@ async fn supply(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 		.await?;
 		db.commit().await?;
 	}
+	Ok(())
+}
+
+#[command("move")]
+#[description("Move a single direction in any of the 8 surrounding squares.  Format can be
+ * Like the keyboard number where 2 is down, 8 is up, 3 is lower-right, etc...
+ * A direction name as a single character like r, l, u, or d, or dr for down-right, ul for up-left, etc...
+ * A directional name like right/left/up/down/up-right/down-left/etc...
+ * A cardinal direction as a single character like N for up, E for right, NW for up-left, SE for down-right, etc..
+ * A cardinal direction as a full name like north, east, south, west, or north-east, south-west, etc...")]
+#[usage("<direction>{1,2}")]
+#[example("N")]
+#[example("up-right")]
+#[example("9")]
+#[min_args(1)]
+#[max_args(1)]
+#[only_in(guilds)]
+async fn move_(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+	let direction = match args.single::<Direction>() {
+		Ok(direction) => direction,
+		Err(reason) => {
+			msg.reply(ctx, format!("Invalid direction: {:?}", reason))
+				.await?;
+			return Err(anyhow::anyhow!("unsupported argument"))?;
+		}
+	};
+	let guild_id_ = msg.guild_id.unwrap().0 as i64;
+	let user_id_ = msg.author.id.0 as i64;
+	let mut db = DB::begin(ctx).await?;
+	let game = db.get_game(guild_id_, Some((ctx, msg))).await?;
+	let player = db.get_player(guild_id_, user_id_, Some((ctx, msg))).await?;
+	if player.actions == 0 {
+		msg.reply(ctx, "Out of actions, cannot move").await?;
+		return Err(anyhow::anyhow!("unable to move due to out of actions"))?;
+	}
+	let (pos_x, pos_y) =
+		match direction.offset_values(player.pos_x, player.pos_y, game.width, game.height) {
+			Some((x, y)) => (x, y),
+			None => {
+				msg.reply(ctx, "Cannot move past a wall").await?;
+				return Err(anyhow::anyhow!("cannot move past a wall"))?;
+			}
+		};
+	sqlx::query!(
+		"UPDATE game_server_players SET actions = actions - 1, pos_x = ?, pos_y = ? WHERE guild_id = ? AND user_id = ?",
+		pos_x,
+		pos_y,
+		guild_id_,
+		user_id_
+	)
+	.execute(&mut db)
+	.await?;
+	db.commit().await?;
+	println!(
+		"Successfully moved {} in server {} to {}:{}",
+		user_id_, guild_id_, pos_x, pos_y
+	);
+	msg.reply(ctx, "Successfully moved, showing board").await?;
+	board(ctx, msg, args).await?;
 	Ok(())
 }
